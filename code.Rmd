@@ -1,0 +1,592 @@
+---
+title: "main"
+author: "SB Chelluri"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+The code has been divided into multiple different sections for ease of replication.
+
+## Initial pre-processing and feature engineering
+
+``` r
+library(tidyverse)
+library(tidygeocoder)
+library(sf)
+library(RANN)
+
+
+# setting working directory
+setwd("YOUR_WORKING_DIRECTORY")
+# reading listings.csv 
+data <- read.csv("./listings.csv")
+
+# dropping uneccessary variables
+data <- data %>%
+  select(-c(listing_url, scrape_id, last_scraped, 
+            source, picture_url, host_id, host_url, 
+            host_thumbnail_url, host_picture_url, 
+            host_listings_count, host_total_listings_count, 
+            neighbourhood, neighbourhood_group_cleansed, 
+            bathrooms_text, calendar_updated, first_review, 
+            last_review, license, name, minimum_minimum_nights, 
+            maximum_minimum_nights, maximum_maximum_nights, 
+            minimum_minimum_nights, host_verifications, 
+            host_name))
+
+# converting variables to correct data types
+data <- data %>% 
+  mutate(
+    # converting continuous data types
+    price = as.numeric(gsub("[$,]", "", price)), 
+    host_response_rate = as.numeric(gsub("[,%]", "", host_response_rate)), 
+    host_acceptance_rate = as.numeric(gsub("[,%]", "", host_acceptance_rate)), 
+    
+    # converting boolean data types to factor types
+    host_has_profile_pic = factor(
+      case_when(host_has_profile_pic == "t" ~ TRUE,
+                host_has_profile_pic == "f" ~ FALSE,
+                host_has_profile_pic == "" ~ NA)),
+    
+    host_identity_verified = factor(
+      case_when(host_identity_verified == "t" ~ TRUE,
+                host_identity_verified == "f" ~ FALSE,
+                host_identity_verified == "" ~ NA)), 
+    
+    has_availability = factor(
+      case_when(has_availability == "t" ~ TRUE,
+                has_availability == "f" ~ FALSE,
+                has_availability == "" ~ NA)),
+    
+    instant_bookable = factor(
+      case_when(instant_bookable == "t" ~ TRUE,
+                instant_bookable == 'f' ~ FALSE)),
+    
+    host_is_superhost = factor(
+      case_when(host_is_superhost == "t" ~ TRUE,
+                host_is_superhost == "f" ~ FALSE,
+                host_is_superhost == "" ~ NA)),
+    
+    # coverting date types to dates
+    host_since = as.Date.character(host_since, tryFormats = "%Y-%m-%d"), 
+    calendar_last_scraped = as.Date.character(
+      calendar_last_scraped, tryFormats = "%Y-%m-%d"),
+    
+    # creating experience variable
+    exper = as.numeric(calendar_last_scraped - host_since), 
+    
+    # converting formatting variables to factors accordingly
+    host_response_time = factor(host_response_time), 
+    room_type= factor(room_type), 
+    neighbourhood_cleansed = factor(neighbourhood_cleansed), 
+    ) %>%
+  
+  # categorising property types based on AirBnB website
+  mutate(property_category = case_when(
+    # Flat/Apartment
+    grepl("apartment|condo|loft|rental unit|vacation home|serviced apartment", 
+          property_type, ignore.case = TRUE) ~ "Flat/Apartment",
+    
+    # House
+    grepl("home|house|townhouse|bungalow|cottage|villa|chalet", 
+          property_type, ignore.case = TRUE) ~ "House",
+    
+    # Secondary unit
+    grepl("guest suite|guesthouse|tiny home|cabin", 
+          property_type, ignore.case = TRUE) ~ "Secondary unit",
+    
+    # Unique space
+    grepl("treehouse|yurt|farm stay|campsite|shepherd|lighthouse|island|dome|tent", 
+          property_type, ignore.case = TRUE) ~ "Unique space",
+    grepl("boat|castle|hut|barn|tower|cave|shipping container|cycladic home|earthen home|minsu|riad|religious building", 
+          property_type, ignore.case = TRUE) ~ "Unique space",
+    
+    # Bed and breakfast
+    grepl("bed and breakfast", 
+          property_type, ignore.case = TRUE) ~ "Bed and breakfast",
+    
+    # Boutique hotel
+    grepl("hotel|hostel|boutique", 
+          property_type, ignore.case = TRUE) ~ "Boutique hotel",
+    
+    # Default category
+    TRUE ~ "Other"
+  )) %>% select(-c(property_type, host_since, calendar_last_scraped)) %>%
+  mutate(property_category = as.factor(property_category))
+  
+
+# calculating the number of neighbours
+coordinates <- data %>% select(id, longitude, latitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 3857) %>%# converting to meters
+  mutate(geometry = st_coordinates(geometry))
+
+# Finding Neighbours withing 1 kilometer radius
+nn_result <- nn2(coordinates$geometry, k = 2000, 
+                 searchtype = "radius", radius = 1000)
+  
+# adding them to the main dataset
+data <- data %>%
+  mutate(neighbours = rowSums(nn_result$nn.dists <= 5000, na.rm = TRUE) - 1)
+
+
+# calculating distance from center
+# London coordinates 
+london_lon <- -0.1276
+london_lat <- 51.5074
+
+# Converting to meters approximately (1 degree ~ 111000 meters)
+data <- data %>%
+  mutate(dist_from_london = sqrt(
+      ((longitude - london_lon) * 111320 * cos(latitude * pi / 180))^2 + 
+      ((latitude - london_lat) * 110540)^2
+    )
+  )
+# calculating nearest tube distance
+
+# loading tube data
+tube <- read.csv("./tube_data.csv") %>%
+  # unpacking all train lines
+  separate_rows(LINES, sep = ",") %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = LINES, values_from = value, values_fill = 0) %>%
+  
+  # counting number of train lines and formatting NETWORK
+  mutate(connections = rowSums(select(., 4:22), na.rm = TRUE), 
+         NETWORK = as.factor(NETWORK)) %>%
+  # selecting variables of interest only
+  select(c(NETWORK, latitude, longitude, connections))
+
+# computing nearest station
+find_nearest_tube <- function(lat, lon, tube) {
+  
+  # calculating euclidean distance in degrees
+  distances <- (lat - tube$latitude)^2 + (lon - tube$longitude)^2
+  
+  # finding index of the nearest station
+  nearest_index <- which.min(distances)
+  # returning all the details of nearest station & distance in 
+  # degrees
+  return(tube[nearest_index, ] %>% 
+           mutate(distance_meters = distances[nearest_index]))
+}
+
+data <- data %>%
+  rowwise() %>%
+  mutate(
+    nearest_tube = list(find_nearest_tube(latitude, longitude, tube))
+  ) %>%
+  unnest_wider(nearest_tube, names_sep = "_tube") %>%
+  select(-c(nearest_tube_tubelatitude, nearest_tube_tubelongitude))
+
+# removing unecessary variables for memory 
+rm(tube, find_nearest_tube)
+
+
+# encoding host neighbourhood and host location into latitude and longitude
+
+# getting all unique host locations
+host.loc.data <- data %>% as_tibble() %>%
+  select(host_location) %>%
+  # imputing under assumption that host is London Based
+  mutate(host_location = ifelse(host_location == "", "London, United Kingdom", 
+                                host_location)) %>%
+  distinct(host_location) %>%
+  # geocoding using OpenStreetMap
+  geocode(loc, ,method = "osm", lat = "host.lat", long = "host.long")
+
+# merging both data sets
+data <- data %>%
+  mutate(host_location = ifelse(host_location == "", "London, United Kingdom", 
+                                host_location)) %>%
+  left_join(host_location_data, by = join_by(host_location, host_neighbourhood), 
+            relationship = "many-to-one") %>%
+  select(-c(host_location, host_neighbourhood))
+
+# removing unecessary variables for memory optimisation
+rm(nn_result, coordinates, london_lat, london_lon, host.loc.data)
+# gc()
+```
+
+## Text Embeddings and PCA
+
+``` r
+library(text)
+library(jsonlite)
+library(parallel)
+library(pbapply)
+
+# defining embedding text function with all-MiniLM-L6-v2 to embed text data
+embed_text <- function(texts) {
+  return(text::textEmbed(texts = texts, 
+                         model = "sentence-transformers/all-MiniLM-L6-v2", 
+                         tokenizer_parallelism = TRUE, 
+                         keep_token_embeddings = FALSE))
+}
+
+
+# making list of all amenities written by hosts
+amenities <- data %>% 
+  select(amenities, id) %>% # only selecting amenties
+  mutate(amenities = map(amenities, ~fromJSON(.))) %>% # unpacking the JSON file
+  group_by(id) %>%
+  summarise(amenities = paste(amenities, collapse = ", "))
+
+
+# processing all other text data
+text_data <- data %>% inner_join(amenities, by = join_by(id)) %>%
+  select(c(description, neighborhood_overview, 
+           host_about)) %>%
+  
+  # imputing missing values with "missing_text" token
+  mutate(across(where(is.character), ~ ifelse(. == "", "missing_text", .))) %>%
+  
+  # merging amenities
+  inner_join(amenities, by=join_by(id))
+ 
+# removing unecessary variables for memory efficiency
+rm(amenities)
+
+# conducting text embedding of text variables:
+# using 8 cores from my 12 core CPU
+num_cores <- 8
+text_data <- text_data %>%
+    mutate(across(where(is.character), ~ pblapply(.x, embed_text, cl=num_cores)))
+
+# unpacking vectors:
+text_data <- text_data %>%
+  mutate(across(where(is.list), ~ map(.x, as.numeric))) %>%
+  unnest_wider(where(is.list), names_sep = "_") %>%
+  scale()
+
+
+# list of features
+features <- c("description","neighborhood_overview", 
+              "host_about", "amenities", "host_verifications")
+
+# initialising pca vector
+pca_list <- c()
+
+# writing a loop to conduct PCA
+for (i in features){
+  
+  # getting the columm list and choosing the columns
+  column_list <- paste(i,"_", 1:384, sep = "")
+  subset_df <- text_data %>% select(all_of(column_list)) 
+  
+  
+  print(paste("Starting PCA of ", i))
+  # conducting PCA
+  pca <- prcomp(subset_df)
+  
+  # computing cumulative proportion of variation (PVE)
+  pve <- cumsum((pca$sdev^2) / sum(pca$sdev^2))
+  
+  # finding the number of principal components that explain 80% of variation
+  pc_80 <- which(pve >= 0.8)[1]
+  
+  # exctracting the 80% Principal components
+  pc_scores <- as_tibble(pca$x[, 2:pc_80+1])  
+  
+  # Rename columns for clarity
+  colnames(pc_scores) <- paste0(i, "_PC", 1:pc_80)
+  
+  # saving pca objects
+  pca_list <- append(pca_list, pc_scores)  
+  
+  # clearing objects for memory efficiency
+  rm(column_list, subset_df, pca, pve, pc_80,  pc_scores)
+  
+  # printing for update
+  print(paste("Finished PCA of ", i))
+}
+
+# saving as a tibble
+pca_tibble <- as_tibble(do.call(cbind, pca_list))
+
+# binding it to the main set
+data <- bind_cols(data, pca_tibble) 
+
+# removing all the original text columns
+data <- data %>% 
+  select(-c("description", "neighborhood_overview",
+            "host_about", "amenities"))
+
+# removing unecessary files
+rm(pca_tibble, text_data, features, i, pca_list, pc_df)
+```
+
+## Initial Visualisation
+
+``` r
+# CODE FOR FIGURE 1:
+library(ggcorrplot)
+# calculating correlation matrix of specific variables
+corr_dat <- data %>% 
+  drop_na(price, bathrooms, bedrooms, 
+          accommodates, exper, beds, 
+          review_scores_rating,  
+          minimum_nights, maximum_nights, 
+          number_of_reviews, 
+          host_response_rate, 
+          host_acceptance_rate) %>%
+  select(c(price, bathrooms, bedrooms, 
+           accommodates, exper, beds, 
+           review_scores_rating, 
+           minimum_nights, maximum_nights, 
+           number_of_reviews, 
+           host_response_rate, 
+           host_acceptance_rate)) %>%
+  cor()
+# renaming the labels of the correlation matrix
+lbl <- c("price", "bathrooms", "bedrooms", 
+         "accomodates", "experience", "beds", 
+         "review score", "min nights", 
+         "max nights", "# reviews", "response rate", 
+         "acceptance rate")
+rownames(corr_dat) <- colnames(corr_dat) <- lbl
+# plotting correlation heatmap
+ggcorrplot(corr = corr_dat, title = "Correlation heatmap of main numeric variables", lab=F) + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+
+# CODE FOR FIGURE 2:
+# reading London's shapefile in my directory
+lndn <- st_read("./London_GLA_Boundary.shp")
+
+data_sf <- st_as_sf(data, coords = c("longitude", "latitude"), crs = 4326)
+
+# Transform to British National Grid (EPSG:27700) & unpack geometry
+data_sf <- st_transform(data_sf, crs = 27700)
+data_sf <- data_sf %>% mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2])
+
+
+# plotting the graph
+ggplot() + 
+  # Layer 1: plotting London
+  geom_sf(data = lndn, size = 1.5, color = "black", fill = "white") +  
+  # Layer 2: Plotting latitude and longitude based on the size of neighbours
+  geom_point(data = data_sf, aes(x = x, y = y, size = neighbours, color = neighbours), alpha = 0.6) + 
+  # setting size, color and legend
+  scale_size(range = c(1, 5), name = "Airbnbs in 1km radius") +  
+  scale_color_gradient(low = "blue", high = "red", name = "Airbnbs in 1km radius") +  
+  guides(size = guide_legend(), color = guide_legend()) +  
+  labs(title = "Density of Listings in London", x = "longitude", y = "latitude") + 
+  theme_bw() +
+  coord_sf() + 
+  # centering title and removing grid
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5), 
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"  
+  )
+
+
+# CODE FOR FIGURE 3(a):
+ggplot(data, aes(x = price)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 fill = "lightblue", 
+                 color = "black") +
+  geom_density(color = "orange", linewidth = 1.2) + 
+  labs(title = "Distribution of Price (0% winsorisation)", 
+       x = "price", 
+       y = "density") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## Final Preprocessing
+
+``` r
+library(tidymodels)
+library(fastDummies)
+
+# re-formatting final dataset
+data <- data %>%
+  mutate_if(is.integer, as.numeric) 
+
+# pre-processing data
+recipe_obj <- recipe(price ~ ., data = data) %>%
+  step_normalize(all_numeric_predictors()) %>%    # Normalize numeric predictors
+  prep(training = data, retain = TRUE)            # Prepare the recipe
+
+# Apply the recipe transformations to the data
+data <- bake(recipe_obj, new_data = data)
+
+# Finding all factor variables
+factor_columns <- names(data)[sapply(data, is.factor)]
+
+# Setting winsorization level
+winsorization <- 0.025
+
+# Additional pre-processing pipeline
+data <- data %>% 
+  drop_na(price) %>%
+  # Winsorizing prices
+  filter(
+    price >= quantile(price, 0.025) &
+    price <= quantile(price, 0.975)
+  ) %>%
+  # binarising factor variables
+  dummy_cols(select_columns = factor_columns,
+             remove_first_dummy = FALSE,
+             remove_selected_columns = TRUE) %>%
+  drop_na()
+
+# setting seed
+set.seed(42)
+
+# splitting the data into train, cross-validation and test
+split <- initial_split(data, prop = 0.8)
+train_val <- training(split)  # 80% (train + validation)
+test <- testing(split)        # 20% (test)
+
+# Spliting the 85% into 70% train and 15% validation
+train_val_split <- initial_split(train_val, prop = 0.75)  # 60% of total data
+train <- training(train_val_split)   # 60% for training 
+validation <- testing(train_val_split) # 20% for validation
+
+# splitting train into features and target
+X_train <- train %>% select(-c(id, price)) %>% data.matrix()
+y_train <- train %>% select(c(price)) %>% as.matrix()
+
+# splitting cross-val into features and target
+X_cv <- validation %>% select(-c(id, price)) %>% data.matrix()
+y_cv <- validation %>% select(c(price)) %>% as.matrix()
+
+# splitting test into features and target
+X_test <- test %>% select(-c(id, price)) %>% data.matrix()
+y_test <- test %>% select(c(price)) %>% as.matrix()
+
+# deleting unecessary variables from environment
+rm(recipe_obj, factor_columns, winsorization, split, 
+    train_val_split, train_val, train, test, validation)
+```
+
+## Training, Tuning, and Testing
+
+``` r
+library(xgboost)
+
+# setting XGB pointers for faster compute
+dtrain <- xgb.DMatrix(data = X_train, label =y_train)
+dcv <- xgb.DMatrix(data = X_cv, label = y_cv)
+
+# tuning hyper-parameters
+params <- list(
+  objective = "reg:squarederror",  
+  booster = "gbtree",              
+  eta = 1e-03,                     
+  max_depth = 5,                   
+  subsample = 0.3,               
+  colsample_bytree = 0.823, 
+  gamma = 0.327, 
+  lambda = 2000, 
+  alpha = 0.2
+)
+
+# training model
+xgb.model <- xgb.train(params, dtrain, nrounds = 50000, 
+                       early_stopping_rounds = 2,
+                       watchlist = list(train = dtrain, cv = dcv))
+
+
+# creating evaluation metrics
+rsq <- function(actual, predicted){
+  rss <- sum((actual - predicted)^2)
+  tss <- sum((actual - mean(actual))^2)
+  rho <- 1 - (rss/tss)
+  return(rho)
+}
+
+mae <- function(actual, predicted){
+  result <- mean(abs(actual - predicted))
+  return(result)
+}
+
+rmse <- function(actual, predicted){
+  result <- sqrt(mean((actual - predicted)^2))
+  return(result)
+}
+
+# out-of-sample performance
+xgb.pred <- predict(xgb.model, X_test)
+xgb.test.rmse <- rmse(y_test, xgb.pred)
+xgb.test.mae <- mae(y_test, xgb.pred)
+xgb.test.rsq <- rsq(y_test, xgb.pred)
+
+# in-sample performance
+xgb.fitted <- predict(xgb.model, X_train)
+xgb.train.rmse <- rmse(y_train, xgb.fitted)
+xgb.train.mae <- mae(y_train, xgb.fitted)
+xgb.train.rsq <- rsq(y_train, xgb.fitted)
+
+# cross-validation performance
+xgb.cv.pred <- predict(xgb.model, X_cv)
+xgb.cv.rmse <- rmse(y_cv, xgb.cv.pred)
+xgb.cv.mae <- mae(y_cv, xgb.cv.pred)
+xgb.cv.rsq <- rsq(y_cv, xgb.cv.pred)
+```
+
+## Final Visualisation and presentation
+
+``` r
+library(ggtext)
+# CODE FOR FIGURE 3(b): same as 3(a) but price has been winsorised
+ggplot(data, aes(x = price)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 fill = "lightblue", 
+                 color = "black") +
+  geom_density(color = "orange", linewidth = 1.2) + 
+  labs(title = "Distribution of Price (2.5% winsorisation)", 
+       x = "price", 
+       y = "density") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# CODE FOR FIGURE 4(a)
+ggplot(data = data.frame(xgb.pred, y_test)) + 
+  geom_point(aes(x = xgb.pred, y = y_test), color = "steelblue") + 
+  geom_abline(slope = 1, intercept =  0, 
+              color = "red", lty = "dashed", lwd = 1) + 
+  labs(title = "Test set on Predictions - XGBoost", 
+       x = "price predictions", y = "prices (test set)", 
+       caption = paste("*R*<sup>2</sup>:", round(xgb.test.rsq, 2), 
+                       "RMSE: ", round(xgb.test.rmse, 2)))+
+  theme_bw() + 
+  theme(plot.title = element_text(face="bold", hjust = 0.5), 
+        plot.caption = element_markdown())
+
+# CODE FOR FIGURE 4(b)
+ggplot(data = xgb.model$evaluation_log) + 
+  geom_line(aes(x = iter, y = train_rmse, color = "Train MSE"), 
+            linewidth = 0.75) + 
+  geom_line(aes(x = iter, y = cv_rmse, color = "CV MSE"), 
+            linewidth = 0.75) + 
+  scale_color_manual(values = c("Train MSE" = "steelblue", 
+                                "CV MSE" = "orange")) + 
+  labs(title = "Train vs CV RMSE of XGBoost", 
+       x = "iterations", 
+       y = "RMSE", 
+       color = "Metric") + 
+  theme_bw() + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# CODE FOR Table 2:
+library(knitr)
+library(kableExtra)
+
+# Create a data frame with evaluation metrics
+results <- data.frame(
+  "Evaluation metric" = c("RMSE", "MAE", "$R^2$", "# Observations"),
+  "train" = c(xgb.train.rmse, xgb.train.mae, xgb.train.rsq, length(y_train)),
+  "cross-validation" = c(xgb.cv.rmse, xgb.cv.mae, xgb.cv.rsq, length(y_cv)),
+  "test" = c(xgb.test.rmse, xgb.test.mae, xgb.test.rsq, length(y_test))
+)
+
+# Create LaTeX formatted table
+kable(results, format = "latex", booktabs = TRUE, escape = FALSE,
+      caption = "Evaluation scores of XGBoost", digits = 3) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
