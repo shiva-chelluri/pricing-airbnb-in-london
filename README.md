@@ -54,7 +54,7 @@ the chosen features are organised into four categories:
     data-reference="fig:corrmap">1</a>, they are selected.
 
     <figure id="fig:corrmap">
-    <img src="media/images/correlation heatmap.png" style="width:50.0%" />
+    <img src="media/images/correlation heatmap.png" style="width:25.0%" />
     <figcaption>correlation heatmap of listings’ attributes &amp;
     traditional signals</figcaption>
     </figure>
