@@ -55,8 +55,6 @@ the chosen features are organised into four categories:
 
     <figure id="fig:corrmap">
     <img src="media/images/correlation heatmap.png" style="width:67.5%" />
-    <figcaption>correlation heatmap of listings’ attributes &amp;
-    traditional signals</figcaption>
     </figure>
 
 2.  **Host Attributes:** Being a
@@ -89,7 +87,7 @@ the chosen features are organised into four categories:
 
     <figure id="fig:listing_density">
     <img src="media/images/listing_density.png" style="width:67.5%" />
-    <figcaption>Density of Listings in London</figcaption>
+    
     </figure>
 
 4.  **Traditional Signals:** Traditional signals, such as review scores
@@ -362,4 +360,5 @@ at: <https://doi.org/10.1108/IJCHM-02-2019-0106>.
 </div>
 
 [^1]: Result from Problem Set 1, Question 6
+
 
